@@ -24,57 +24,22 @@ module staghorn_core #(
 
 logic [31:0] registers [1:31];
 logic [31:0] pc;
-
-// TODO: move to dedicated write port?
-task automatic write_reg(
-    input logic [4:0] addr,
-    input logic [31:0] value
-);
-    if (addr != 5'd0)
-        registers[addr] <= value;
-endtask
-
-always_ff @(posedge clk) begin
-    if (!rst_n) begin
-        instr_addr_valid <= 1;
-        instr_addr <= RESET_ADDR;
-
-        data_addr_valid <= 0;
-        data_addr <= 0;
-        data_mask <= 0;
-        data_write_data <= 0;
-
-        pc <= RESET_ADDR;
-    end
-    else begin
-        if (!instr_ready) begin
-            // fetch
-            instr_addr_valid <= 1;
-            instr_addr <= pc;
-        end else begin
-            // execute
-            instr_addr_valid <= 0;
-        end
-    end
-end
+logic [31:0] instr_raw;
 
 // Decode
-wire [6:0] opcode = instr_data[6:0];
-wire [2:0] funct3 = instr_data[14:12];
-wire [6:0] funct7 = instr_data[31:25];
+wire [6:0] opcode = instr_raw[6:0];
+wire [2:0] funct3 = instr_raw[14:12];
+wire [6:0] funct7 = instr_raw[31:25];
 
-wire [4:0] rd = instr_data[11:7];
-wire [4:0] rs1 = instr_data[19:15];
-wire [4:0] rs2 = instr_data[24:20];
+wire [4:0] rd = instr_raw[11:7];
+wire [4:0] rs1 = instr_raw[19:15];
+wire [4:0] rs2 = instr_raw[24:20];
 
-wire [31:0] rs1_data = rs1 == 0 ? 32'b0 : registers[rs1];
-wire [31:0] rs2_data = rs2 == 0 ? 32'b0 : registers[rs2];
-
-wire [31:0] imm_i = {{20{instr_data[31]}}, instr_data[31:20]};
-wire [31:0] imm_s = {{20{instr_data[31]}}, instr_data[31:25], instr_data[11:7]};
-wire [31:0] imm_b = {{19{instr_data[31]}}, instr_data[31], instr_data[7], instr_data[30:25], instr_data[11:8], 1'b0};
-wire [31:0] imm_u = {instr_data[31:12], 12'b0};
-wire [31:0] imm_j = {{11{instr_data[31]}}, instr_data[31], instr_data[19:12], instr_data[20], instr_data[30:21], 1'b0};
+wire [31:0] imm_i = {{20{instr_raw[31]}}, instr_raw[31:20]};
+wire [31:0] imm_s = {{20{instr_raw[31]}}, instr_raw[31:25], instr_raw[11:7]};
+wire [31:0] imm_b = {{19{instr_raw[31]}}, instr_raw[31], instr_raw[7], instr_raw[30:25], instr_raw[11:8], 1'b0};
+wire [31:0] imm_u = {instr_raw[31:12], 12'b0};
+wire [31:0] imm_j = {{11{instr_raw[31]}}, instr_raw[31], instr_raw[19:12], instr_raw[20], instr_raw[30:21], 1'b0};
 
 typedef enum logic [2:0] {
     ALU_ADD_SUB = 3'b000,
@@ -115,7 +80,6 @@ typedef struct packed {
     logic mem_unsigned;
 
     rd_sel_t rd_sel; // what is set into rd
-    logic [4:0] rd;
 
     pc_sel_t pc_sel; // where the pc goes after the instruction
 
@@ -126,7 +90,6 @@ instr_t instr;
 
 always_comb begin
     instr = '0;
-    instr.rd = rd;
 
     // TODO: find way to decode illegal instructions better
     case (opcode)
@@ -145,11 +108,11 @@ always_comb begin
 
             instr.alu_a = SRC_A_RS1;
             instr.alu_b = SRC_B_IMM;
-            instr.alu_alt = instr_data[30] && funct3 == 3'b101;
+            instr.alu_alt = instr_raw[30] && funct3 == 3'b101;
             instr.imm = imm_i;
             instr.rd_sel = RD_ALU;
 
-            instr.illegal = ((funct3 == 3'b001 || funct3 == 3'b101) && (instr_data[31:25] & ~7'h20) != 0) || (funct3 == 3'b001 && instr_data[30]);
+            instr.illegal = ((funct3 == 3'b001 || funct3 == 3'b101) && (instr_raw[31:25] & ~7'h20) != 0) || (funct3 == 3'b001 && instr_raw[30]);
         end
         7'h03: begin // load
             instr.mem_r = 1;
@@ -184,13 +147,13 @@ always_comb begin
             instr.rd_sel = RD_NONE;
 
             case (funct3[2:1])
-                2'b00: instr.alu_op = ALU_XOR; // rs1 ^ rs2 == 0 -> rs1 == rs2 (eq/beq)
+                2'b00: instr.alu_op = ALU_XOR; // rs1 ^ rs2 == 0 -> rs1 == rs2 (eq/ne)
                 2'b10: instr.alu_op = ALU_SLT; // lt/ge signed
                 2'b11: instr.alu_op = ALU_SLTU; // lt/ge unsigned
                 default: instr.illegal = 1;
             endcase
 
-            instr.branch_cond_inv = funct3[0];
+            instr.branch_cond_inv = funct3[0] ^ ~funct3[2]; // inv on beq, bge, bgeu
         end
         7'h37: begin // load upper immediate (u)
             instr.alu_a = SRC_A_ZERO;
@@ -229,7 +192,7 @@ always_comb begin
             // endcase
         end
         7'h73: begin // system
-            instr.illegal = (funct3 != 3'b000) || (instr_data[31:21] != 0) || (rs1 != 0) || (rd != 0);
+            instr.illegal = (funct3 != 3'b000) || (instr_raw[31:21] != 0) || (rs1 != 0) || (rd != 0);
             // case(func3)
             //     3'b000:
             //         // ECALL / EBREAK (funct 7 = 0100000)
@@ -253,7 +216,117 @@ always_comb begin
 end
 
 // Execute
-logic [31:0] next_pc = pc + 4;
+wire [31:0] rs1_data =  rs1 == 0 ? 32'b0 : registers[rs1];
+wire [31:0] rs2_data =  rs2 == 0 ? 32'b0 : registers[rs2];
+
+logic [31:0] alu_a;
+always_comb case (instr.alu_a)
+    SRC_A_RS1: alu_a = rs1_data;
+    SRC_A_PC: alu_a = pc;
+    default: 32'b0;
+endcase
+
+logic [31:0] alu_b;
+always_comb case (instr.alu_b)
+    SRC_B_RS2: alu_b = rs2_data;
+    SRC_B_IMM: alu_b = instr.imm;
+endcase
+
+logic [31:0] alu_result;
+// todo: switch away from naive version and share adders?, compare with yosys
+always_comb case (instr.alu_op)
+    ALU_ADD_SUB: alu_result = instr.alu_alt ? alu_a - alu_b : alu_a + alu_b;
+    ALU_SLL: alu_result = alu_a << alu_b[4:0];
+    ALU_SLT: alu_result = {31'b0, $signed(alu_a) < $signed(alu_b)};
+    ALU_SLTU: alu_result = {31'b0, alu_a < alu_b};
+    ALU_XOR: alu_result = alu_a ^ alu_b;
+    ALU_SRL_SRA: alu_result = instr.alu_alt ? $signed(alu_a) >>> alu_b[4:0] : alu_a >> alu_b[4:0];
+    ALU_OR: alu_result = alu_a | alu_b;
+    ALU_AND: alu_result = alu_a & alu_b;
+    default: alu_result = 32'bx;
+endcase
+
+wire branch_taken = instr.branch & (|alu_result ^ instr.branch_cond_inv);
+
+wire [31:0] pc_default_next = pc + 32'd4;
+logic [31:0] pc_next;
+always_comb case (instr.pc_sel)
+    PC_BRANCH: pc_next = branch_taken ? pc + instr.imm : pc_default_next;
+    PC_ALU: pc_next = {alu_result[31:1], 1'b0};
+    default: pc_next = pc_default_next;
+endcase
+
+// Memory
+wire [31:0] mem_addr = alu_result; // rs1 + imm
+wire [1:0] mem_offset = mem_addr[1:0];
+wire mem_access = instr.mem_r | instr.mem_w;
+
+// TODO: support misaligned memory
+logic mem_misaligned;
+always_comb case (instr.mem_width)
+    MEM_H: mem_misaligned = mem_access & mem_offset[0];
+    MEM_W: mem_misaligned = mem_access & (mem_offset != 2'b00);
+    default: mem_misaligned = 0;
+endcase
+
+logic [3:0] mem_mask;
 always_comb begin
+    mem_mask = 4'b0000;
+    if (instr.mem_w) case (instr.mem_width)
+        MEM_B: mem_mask = 4'b0001 << mem_offset;
+        MEM_H: mem_mask = 4'b0011 << mem_offset;
+        default: mem_mask = 4'b1111;
+    endcase
 end
+
+logic [31:0] mem_write_data;
+always_comb case (instr.mem_width)
+    MEM_B: mem_write_data = {4{rs2_data[7:0]}};
+    MEM_H: mem_write_data = {2{rs2_data[15:0]}};
+    default: mem_write_data = rs2_data;
+endcase
+
+wire [31:0] load_shifted = data_read_data >> {mem_offset, 3'b000}; // offset * 8
+
+logic [31:0] load_value;
+always_comb case (instr.mem_width)
+    MEM_B: load_value = {{24{~instr.mem_unsigned & load_shifted[7]}}, load_shifted[7:0]};
+    MEM_H: load_value = {{16{~instr.mem_unsigned & load_shifted[15]}}, load_shifted[15:0]};
+    default: load_value = load_shifted;
+endcase
+
+wire rd_wants_write = instr.rd_sel != RD_NONE;
+logic [31:0] rd_value;
+always_comb case (instr.rd_sel)
+    RD_ALU: rd_value = alu_result;
+    RD_MEM: rd_value = load_value;
+    RD_PC4: rd_value = pc_default_next;
+    default: rd_value = 32'd0;
+endcase
+
+// Clocked logic
+always_ff @(posedge clk) begin
+    if (!rst_n) begin
+        instr_addr_valid <= 1;
+        instr_addr <= RESET_ADDR;
+
+        data_addr_valid <= 0;
+        data_addr <= 0;
+        data_mask <= 0;
+        data_write_data <= 0;
+
+        pc <= RESET_ADDR;
+    end
+    else begin
+        if (!instr_ready) begin
+            // fetch
+            instr_addr_valid <= 1;
+            instr_addr <= pc;
+        end else begin
+            // execute
+            instr_addr_valid <= 0;
+        end
+    end
+end
+
 endmodule

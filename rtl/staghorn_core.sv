@@ -5,21 +5,23 @@ module staghorn_core #(
     input wire clk,
     input wire rst_n, // active low!
 
-    // Instruction port
-    output logic instr_addr_valid,
-    output logic [31:0] instr_addr,
-    input wire instr_ready,
-    input wire [31:0] instr_data,
+    output logic instr_req,
+    output logic [31:0] instr_req_addr,
 
-    // Data port (r/w)
-    output logic data_addr_valid,
-    output logic [31:0] data_addr,
-    // 0 = load, 1 = write (w/ mask)
-    output logic [3:0] data_mask,
-    // high if read/write succeeded
-    input wire data_ready,
-    output logic [31:0] data_write_data,
-    input wire [31:0] data_read_data
+    input wire instr_req_granted,
+    input wire instr_rsp_valid,
+    input wire [31:0] instr_rsp,
+
+    output logic data_req,
+    output logic [31:0] data_req_addr,
+
+    output logic data_req_w,
+    output logic [3:0] data_req_mask,
+    output logic [31:0] data_req_wdata,
+
+    input wire data_req_granted,
+    input wire data_rsp_valid,
+    input wire [31:0] data_rsp
 );
 
 logic [31:0] registers [1:31];
@@ -223,13 +225,13 @@ logic [31:0] alu_a;
 always_comb case (instr.alu_a)
     SRC_A_RS1: alu_a = rs1_data;
     SRC_A_PC: alu_a = pc;
-    default: 32'b0;
+    default: alu_a = 32'b0;
 endcase
 
 logic [31:0] alu_b;
 always_comb case (instr.alu_b)
-    SRC_B_RS2: alu_b = rs2_data;
     SRC_B_IMM: alu_b = instr.imm;
+    default: alu_b = rs2_data;
 endcase
 
 logic [31:0] alu_result;
@@ -240,7 +242,13 @@ always_comb case (instr.alu_op)
     ALU_SLT: alu_result = {31'b0, $signed(alu_a) < $signed(alu_b)};
     ALU_SLTU: alu_result = {31'b0, alu_a < alu_b};
     ALU_XOR: alu_result = alu_a ^ alu_b;
-    ALU_SRL_SRA: alu_result = instr.alu_alt ? $signed(alu_a) >>> alu_b[4:0] : alu_a >> alu_b[4:0];
+    ALU_SRL_SRA: begin
+        if (instr.alu_alt) begin
+            alu_result = $signed(alu_a) >>> alu_b[4:0];
+        end else begin
+             alu_a >> alu_b[4:0];
+        end
+    end
     ALU_OR: alu_result = alu_a | alu_b;
     ALU_AND: alu_result = alu_a & alu_b;
     default: alu_result = 32'bx;
@@ -286,7 +294,7 @@ always_comb case (instr.mem_width)
     default: mem_write_data = rs2_data;
 endcase
 
-wire [31:0] load_shifted = data_read_data >> {mem_offset, 3'b000}; // offset * 8
+wire [31:0] load_shifted = data_rsp >> {mem_offset, 3'b000}; // offset * 8
 
 logic [31:0] load_value;
 always_comb case (instr.mem_width)
@@ -305,26 +313,60 @@ always_comb case (instr.rd_sel)
 endcase
 
 // Clocked logic
+typedef enum logic [1:0] {FETCH, EXECUTE, MEMORY, HALT} core_state_t;
+core_state_t core_state;
+
 always_ff @(posedge clk) begin
     if (!rst_n) begin
-        instr_addr_valid <= 1;
-        instr_addr <= RESET_ADDR;
+        core_state <= FETCH;
 
-        data_addr_valid <= 0;
-        data_addr <= 0;
-        data_mask <= 0;
-        data_write_data <= 0;
+        instr_req <= 1;
+        instr_req_addr <= RESET_ADDR;
+
+        data_req <= 0;
+        data_req_addr <= 0;
+        data_req_w <= 0;
+        data_req_mask <= 0;
+        data_req_wdata <= 0;
 
         pc <= RESET_ADDR;
+        instr_raw <= 0;
     end
     else begin
-        if (!instr_ready) begin
-            // fetch
-            instr_addr_valid <= 1;
-            instr_addr <= pc;
-        end else begin
-            // execute
-            instr_addr_valid <= 0;
+        if (instr_req && instr_req_granted) begin
+            instr_req <= 0;
+        end
+
+        if (data_req && data_req_granted) begin
+            data_req <= 0;
+        end
+
+        if (core_state == HALT) begin
+        end else if (core_state == FETCH && instr_rsp_valid) begin
+            instr_raw <= instr_rsp;
+            core_state <= EXECUTE;
+        end else if (core_state == EXECUTE && (instr.illegal || mem_misaligned)) begin
+           core_state <= HALT;
+        end
+        end else if (core_state == EXECUTE && mem_access) begin
+            data_req <= 1;
+            data_req_addr <= mem_addr;
+            data_req_w <= instr.mem_w;
+            data_req_mask <= mem_mask;
+            data_req_wdata <= mem_write_data;
+            core_state <= MEMORY;
+        end else if (
+            (core_state == MEMORY && data_rsp_valid) ||
+            (core_state == EXECUTE && !mem_access)
+        ) begin
+            if (rd_wants_write && rd != 0) begin
+                registers[rd] <= rd_value;
+            end
+
+            instr_req <= 1;
+            pc <= pc_next;
+            instr_req_addr <= pc_next;
+            core_state <= FETCH;
         end
     end
 end
